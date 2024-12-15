@@ -10,7 +10,7 @@
 
 # dev
 venv/
-
+.env
 # production
 /build
 
