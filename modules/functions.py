@@ -69,10 +69,9 @@ def assign_to_cart(users_id):
             cursor = connection.cursor(dictionary=True)
 
             # Check if user has a cart
-            select_query = "SELECT cart_id FROM cart WHERE users_id = %s LIMIT 1"
+            select_query = "SELECT cart_id FROM cart WHERE users_id = %s order by cart_id desc;"
             cursor.execute(select_query, (users_id,))
             cart_id = cursor.fetchone()
-            
             # If a cart exists, return the cart id
             if cart_id:
                 return cart_id['cart_id']
@@ -99,12 +98,12 @@ def current_cart_db_update(users_email):
     
     cursor = connection.cursor(dictionary=True)
     
-    MOST_RECENT_CART_QUERY = f"""update users
+    MOST_RECENT_CART_QUERY = """update users
     set current_cart_id = (select max(cart_id) from cart where cart.users_id = users.users_id)
-    where users_email = {users_email}
+    where users_email = %s
     """
 
-    cursor.execute(MOST_RECENT_CART_QUERY)
+    cursor.execute(MOST_RECENT_CART_QUERY,(users_email,))
 
 def save_cart(user_id, cart_items):
     connection = get_db_connection()
@@ -121,7 +120,7 @@ def save_cart(user_id, cart_items):
             print("Failed to assign or retrieve cart ID.")
             return jsonify({"success": False, "message": "Failed to assign cart"}), 500
 
-        # delete old items
+        # Delete old items
         delete_query = "DELETE FROM product_pair WHERE cart_id = %s"
         cursor.execute(delete_query, (cart_id,))
         print(f"Cleared existing items in product_pair for cart_id: {cart_id}")
@@ -131,14 +130,11 @@ def save_cart(user_id, cart_items):
         for item in cart_items:
             product_id = item.get("product_id")
             quantity = item.get("quantity")
-            print(f"Attempting to insert product_id: {product_id}, quantity: {quantity}")
-            
             if not product_id or not quantity:
-                print("Invalid item data detected in cart_items:", item)
+                print("Invalid item data detected:", item)
                 continue
-            
             cursor.execute(insert_query, (cart_id, product_id, quantity))
-
+        
         connection.commit()
         print("Cart saved successfully.")
         return jsonify({"success": True, "message": "Cart saved successfully"}), 200
@@ -146,54 +142,109 @@ def save_cart(user_id, cart_items):
     except Exception as e:
         print(f"Error in save_cart function: {e}")
         return jsonify({"success": False, "message": "Failed to save cart"}), 500
+    finally:
+        cursor.close()
+        connection.close()
 
 def get_cart(user_id):
     connection = get_db_connection()
     if not connection:
         return jsonify({"error": "Database connection failed"}), 500
-    
+
     try:
         cursor = connection.cursor(dictionary=True)
-        # Get the user's cart ID
         cart_id = assign_to_cart(user_id)
+        print(f"Retrieved cart_id for user_id {user_id}: {cart_id}")
+
         if not cart_id:
             return jsonify([]), 200  # If no cart, return an empty list
 
-        #get all items that are associated with teh cart
         select_query = """
-            SELECT product_id, product_amount 
-            FROM product_pair 
-            WHERE cart_id = %s
+            SELECT 
+                product_pair.product_id, 
+                product_pair.product_amount, 
+                product.price,
+                product.product_name AS title
+            FROM 
+                product_pair 
+            JOIN 
+                product 
+            ON 
+                product_pair.product_id = product.product_id 
+            WHERE 
+                cart_id = %s
         """
         cursor.execute(select_query, (cart_id,))
         result = cursor.fetchall()
-        cart_items = [{"product_id": row[0], "quantity": row[1]} for row in result]
-        
+        print("Cart items retrieved:", result)
+
+        cart_items = [
+            {
+                "product_id": row["product_id"],
+                "quantity": row["product_amount"],
+                "price": row["price"],
+                "title": row["title"],
+            }
+            for row in result
+        ]
         return jsonify(cart_items), 200
+
     except Exception as e:
         print(f"Error retrieving cart: {e}")
         return jsonify({"success": False, "message": "Failed to retrieve cart"}), 500
-    
+    finally:
+        cursor.close()
+        connection.close()
+
 def checkout(user_id, cart_items):
     connection = get_db_connection()
     if not connection:
         return jsonify({"error": "Database connection failed"}), 500
     try:
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("START TRANSACTION;")        
+        cursor.execute("set transaction isolation level serializable")
+        cursor.execute("START TRANSACTION;")
+        q3 = "insert into sale (cart_id,payment_method,total_amount) values(%s,%s,%s)"
+        total_cost = 0
+                
         for item in cart_items:
-            product_id = item['product_id']
-            quantity = item['quantity']        
-            cursor.execute("SELECT stock FROM product WHERE product_id = %s;", (product_id,))
-            stock = cursor.fetchone()[0]        
+            product_id = item.get('product_id')
+            quantity = item.get('quantity')
+
+            if not product_id or not quantity:
+                print(f"Invalid cart item: {item}")
+                raise ValueError("Invalid cart item data.")
+
+            cursor.execute("SELECT stock FROM product WHERE product_id = %s for update;", (product_id,))
+            stock_row = cursor.fetchone()
+            cursor.execute("select price from product where product_id = %s;",(product_id,))
+            product_price = cursor.fetchone()
+
+            if not stock_row:
+                print(f"Product ID {product_id} not found in the database.")
+                raise ValueError(f"Product ID {product_id} not found.")
+            if not product_price:
+                print(f"Product ID {product_id} not found in the database.")
+                raise ValueError(f"Product ID {product_id} not found.")
+
+            stock = stock_row['stock']
+            print(f"Stock for product {product_id}: {stock}")
+
             if stock >= quantity:
+                total_cost = total_cost + (product_price['price'] * quantity)
                 new_stock = stock - quantity
                 cursor.execute("UPDATE product SET stock = %s WHERE product_id = %s;", (new_stock, product_id))
+                print(f"Updated stock for product {product_id}: {new_stock}")
             else:
-        
+                print(f"Insufficient stock for product {product_id}. Needed: {quantity}, Available: {stock}")
                 cursor.execute("ROLLBACK;")
                 return jsonify({"success": False, "message": f"Insufficient stock for product ID {product_id}."})
+
+        cursor.execute(q3,(assign_to_cart(user_id),"Credit",total_cost))
+        insert_query = "INSERT INTO cart (users_id) VALUES (%s)"
+        cursor.execute(insert_query, (user_id,))
         cursor.execute("COMMIT;")
+        print("Checkout transaction committed successfully.")
         return jsonify({"success": True, "message": "Checkout successful!"})
 
     except Exception as e:
@@ -356,48 +407,54 @@ def authenticate_user(data):
 
 #adds a x amount of stock to a product - allocated by its id
 def add_x_to_product_stock(x,product_id):
-    GET_CURR_STOCK_QUERY = f'select stock from product where product_id = {product_id};'
+    GET_CURR_STOCK_QUERY = "select stock from product where product_id = %s for update;"
     try:
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True) 
-        cursor.execute(GET_CURR_STOCK_QUERY)
+        cursor.execute(GET_CURR_STOCK_QUERY,(product_id,))
         curr_stock = cursor.fetchone()[0]
     except:
+        connection.rollback()
         print("Failed to update value, please double check passed product_id")
     
     updated_stock = curr_stock + x
-    QUERY = f'''
+    QUERY = """
     update product 
-    set stock = {updated_stock}
-    where product_id = {product_id}
-    '''
+    set stock = %s
+    where product_id = %s;
+    """
     try:
-        cursor.execute(QUERY)
+        cursor.execute(QUERY,(updated_stock,product_id))
+        connection.commit()
     except:
+        connection.rollback()
         print("Addition statement failed! Reference database if issue persists")
 
     return updated_stock
 
 #removes a n amount of stock from a product
 def remove_x_from_product_stock(x , product_id):
-    GET_CURR_STOCK_QUERY = f'select stock from product where product_id = {product_id};'
+    GET_CURR_STOCK_QUERY = "select stock from product where product_id = %s for update;"
     try:
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True) 
-        cursor.execute(GET_CURR_STOCK_QUERY)
+        cursor.execute(GET_CURR_STOCK_QUERY,(product_id,))
         curr_stock = cursor.fetchone()[0]
     except:
+        connection.rollback()
         print("Failed to update value, please double check passed product_id")
 
     new_stock = curr_stock - x
-    QUERY = f'''
+    QUERY = """
     update product 
-    set stock = {new_stock}
-    where product_id = {product_id}
-    '''
+    set stock = %s
+    where product_id = %s;
+    """
     try:
-        cursor.execute(QUERY)
+        cursor.execute(QUERY,(new_stock,product_id))
+        connection.commit()
     except Exception as e:
+        connection.rollback()
         print(e)
 
 #utilizes an api call to get req the passed product name's rating and total amount of reviews
@@ -415,10 +472,10 @@ def add_new_product(p_name , p_price , p_stock, category):
     score = ratings["rating"]
     no_of_ratings = ratings["num_of_ratings"]
 
-    INS_INTO_QUERY = f'''
+    INS_INTO_QUERY = """
     INSERT INTO product (product_name , price , stock , rating, num_rating, category)
-    VALUES (%s , %s , %s , %s , %s , %s)
-    '''
+    VALUES (%s , %s , %s , %s , %s , %s);
+    """
 
     try:
         connection = get_db_connection()
@@ -428,6 +485,7 @@ def add_new_product(p_name , p_price , p_stock, category):
         print("Product insertion successful")
         return True, "Product insertion successful"  # Success case
     except Exception as e:
+        connection.rollback()
         print(f"Error inserting product: {e}")
         return False, str(e)  # Error case with the error message
     
@@ -447,6 +505,7 @@ def update_product(p_id, new_name, new_price, new_stock):
         connection.close()
         return jsonify({"success": True, "message": "Product updated"})
     except Exception as e:
+        connection.rollback()
         print(f"Error while updating product: {e}")
         return jsonify({"success": False, "message": "Failed to update product"})
 
@@ -462,8 +521,10 @@ def price_manip(p_id , new_price):
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True) 
         cursor.execute(QUERY, (new_price,p_id))
+        connection.commit()
         print("Price update successful!")
     except Exception as e:
+        connection.rollback()
         print(e)
 
 # change the name of a product in the database via a reference to its id
@@ -478,6 +539,8 @@ def product_name_change(p_id , new_name):
         connection = get_db_connection()
         cursor = connection.cursor(dictionary=True)         
         cursor.execute(QUERY, (new_name,p_id))
+        connection.commit()
         print("Name update successful!")
     except Exception as e:
+        connection.rollback()
         print(e)
